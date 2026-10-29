@@ -10,6 +10,7 @@ DATA_FILE = next((p for p in (BASE_DIR / "data" / "ausgrid_cg_dashboard.npz", BA
                   if p.exists()), BASE_DIR / "data" / "ausgrid_cg_dashboard.npz")
 STEPS = 6            # CG-SFDRLF forecasts 1-6 half-hour steps (30 min to 3 h) ahead
 ALL = "All 21 regions (total)"
+Z = 1.645            # 90% central interval = mu +/- 1.645 sigma; 95% upward reserve = mu + 1.645 sigma
 
 
 # -----------------------------------------------------------------------------
@@ -20,8 +21,10 @@ ALL = "All 21 regions (total)"
 def load_store():
     z = np.load(DATA_FILE)
     store = {k: z[k] for k in z.files}
-    for k in ("L_kw", "PV_kw", "CS_kw", "muL", "muP"):
+    for k in ("L_kw", "PV_kw", "CS_kw", "muL", "muP", "sL", "sP", "rho", "sL_tot", "sP_tot", "sN_tot"):
         store[k] = store[k].astype(np.float32)
+    # net-load standard deviation per window/step/region from the model's load-PV error correlation
+    store["sN"] = np.sqrt(np.maximum(store["sL"] ** 2 + store["sP"] ** 2 - 2 * store["rho"] * store["sL"] * store["sP"], 1e-6))
     store["times"] = pd.date_range(str(store["start"]), periods=store["L_kw"].shape[0], freq="30min")
     return store
 
@@ -36,6 +39,24 @@ def region_labels(store):
 def pick(array, region_idx):
     """Select one region (last axis) or sum all regions."""
     return array.sum(-1) if region_idx is None else array[..., region_idx]
+
+
+def pick_sd(store, key, region_idx, rows=slice(None), h=slice(None)):
+    """Forecast standard deviation for one region, or for the 21-region total using the cross-node error
+    correlation (sigma_tot = sqrt(s' C s), C estimated on the other half of the test blocks)."""
+    if region_idx is None:
+        return store[f"{key}_tot"][rows, h]
+    return store[key][rows, h, region_idx]
+
+
+def add_band(fig, x, mid, sd, name, color, floor=None):
+    """Shaded 90% forecast interval drawn behind the lines."""
+    lo, hi = mid - Z * sd, mid + Z * sd
+    if floor is not None:
+        lo = np.maximum(lo, floor)
+    fig.add_trace(go.Scatter(x=x, y=hi, mode="lines", line=dict(width=0), hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(x=x, y=lo, mode="lines", line=dict(width=0), fill="tonexty", fillcolor=color,
+                             name=name, hoverinfo="skip"))
 
 
 def historical_frame(store, region_idx):
@@ -68,6 +89,9 @@ def test_results(store, region_idx, step=1):
         "Actual Solar (kW)": pick(store["PV_kw"][target], region_idx),
         "Predicted Solar (kW)": pick(store["muP"][:, h, :], region_idx),
         "Clear-sky Solar (kW)": pick(store["CS_kw"][target], region_idx),
+        "Load Std (kW)": pick_sd(store, "sL", region_idx, h=h),
+        "Solar Std (kW)": pick_sd(store, "sP", region_idx, h=h),
+        "Net Std (kW)": pick_sd(store, "sN", region_idx, h=h),
     })
 
 
@@ -202,23 +226,29 @@ with load_tab:
     st.subheader("Electricity Load Analysis")
     st.success("CG-SFDRLF load predictions loaded (Ausgrid test set).")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=results["Time"], y=results["Actual Load (kW)"], mode="lines", name="Actual Load"))
-    fig.add_trace(go.Scatter(x=results["Time"], y=results["Predicted Load (kW)"], mode="lines", name="CG-SFDRLF Predicted Load"))
+    add_band(fig, results["Time"], results["Predicted Load (kW)"], results["Load Std (kW)"], "90% forecast range",
+             "rgba(239,85,59,0.20)")
+    fig.add_trace(go.Scatter(x=results["Time"], y=results["Actual Load (kW)"], mode="lines", name="Actual Load", line=dict(color="#636EFA")))
+    fig.add_trace(go.Scatter(x=results["Time"], y=results["Predicted Load (kW)"], mode="lines", name="CG-SFDRLF Predicted Load", line=dict(color="#EF553B")))
     fig.update_layout(title=f"Actual vs Predicted Electricity Load (Test Set: {period_note})", xaxis_title="Time",
                       yaxis_title="Electricity Load (kW)", template="plotly_dark", height=450)
     st.plotly_chart(fig, use_container_width=True)
     actual, pred = results_all["Actual Load (kW)"], results_all["Predicted Load (kW)"]
-    c1, c2 = st.columns(2)
+    sd = results_all["Load Std (kW)"]
+    c1, c2, c3 = st.columns(3)
     c1.metric("Test MAE", f"{np.mean(np.abs(actual - pred)):.3f} kW")
     c2.metric("Test RMSE", f"{np.sqrt(np.mean((actual - pred) ** 2)):.3f} kW")
-    st.info(metric_note)
+    c3.metric("Inside 90% Range", f"{100 * np.mean(np.abs(actual - pred) <= Z * sd):.1f}%")
+    st.info(metric_note + " The shaded band is the model's 90% forecast range.")
 
 with solar_tab:
     st.subheader("Solar PV Generation Analysis")
     st.success("CG-SFDRLF solar predictions loaded (Ausgrid test set).")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=results["Time"], y=results["Actual Solar (kW)"], mode="lines", name="Actual Solar"))
-    fig.add_trace(go.Scatter(x=results["Time"], y=results["Predicted Solar (kW)"], mode="lines", name="CG-SFDRLF Predicted Solar"))
+    add_band(fig, results["Time"], results["Predicted Solar (kW)"], results["Solar Std (kW)"], "90% forecast range",
+             "rgba(239,85,59,0.20)", floor=0)
+    fig.add_trace(go.Scatter(x=results["Time"], y=results["Actual Solar (kW)"], mode="lines", name="Actual Solar", line=dict(color="#636EFA")))
+    fig.add_trace(go.Scatter(x=results["Time"], y=results["Predicted Solar (kW)"], mode="lines", name="CG-SFDRLF Predicted Solar", line=dict(color="#EF553B")))
     fig.update_layout(title=f"Actual vs Predicted Solar Generation (Test Set: {period_note})", xaxis_title="Time",
                       yaxis_title="Solar Generation (kW)", template="plotly_dark", height=450)
     st.plotly_chart(fig, use_container_width=True)
@@ -236,18 +266,31 @@ with net_tab:
         res["Actual Net Load (kW)"] = res["Actual Load (kW)"] - res["Actual Solar (kW)"]
         res["Predicted Net Load (kW)"] = res["Predicted Load (kW)"] - res["Predicted Solar (kW)"]
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=res["Time"], y=res["Actual Net Load (kW)"], mode="lines", name="Actual Net Load"))
-        fig.add_trace(go.Scatter(x=res["Time"], y=res["Predicted Net Load (kW)"], mode="lines", name="Predicted Net Load"))
+        add_band(fig, res["Time"], res["Predicted Net Load (kW)"], res["Net Std (kW)"], "90% forecast range",
+                 "rgba(239,85,59,0.20)")
+        fig.add_trace(go.Scatter(x=res["Time"], y=res["Actual Net Load (kW)"], mode="lines", name="Actual Net Load", line=dict(color="#636EFA")))
+        fig.add_trace(go.Scatter(x=res["Time"], y=res["Predicted Net Load (kW)"], mode="lines", name="Predicted Net Load", line=dict(color="#EF553B")))
+        fig.add_trace(go.Scatter(x=res["Time"], y=res["Predicted Net Load (kW)"] + Z * res["Net Std (kW)"], mode="lines",
+                                 line=dict(dash="dot", width=1.4, color="#FFA15A"), name="95% Reserve Level"))
+        fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="gray")
         fig.update_layout(title=f"Actual vs Predicted Net Load (Timestamp-Aligned Test Set: {period_note})", xaxis_title="Time",
                           yaxis_title="Net Load (kW)", template="plotly_dark", height=450)
         st.plotly_chart(fig, use_container_width=True)
         actual = results_all["Actual Load (kW)"] - results_all["Actual Solar (kW)"]
         pred = results_all["Predicted Load (kW)"] - results_all["Predicted Solar (kW)"]
+        reserve = Z * results_all["Net Std (kW)"]
         c1, c2 = st.columns(2)
         c1.metric("Net-Load MAE", f"{np.mean(np.abs(actual - pred)):.3f} kW")
         c2.metric("Net-Load RMSE", f"{np.sqrt(np.mean((actual - pred) ** 2)):.3f} kW")
+        c3, c4, c5 = st.columns(3)
+        c3.metric("Average 95% Reserve", f"{reserve.mean():.2f} kW")
+        c4.metric("Reserve Was Enough", f"{100 * np.mean(actual <= pred + reserve):.1f}% of the time")
+        rev = actual < 0
+        c5.metric("Reverse-Flow Periods Flagged", f"{100 * np.mean(pred[rev] < 0):.0f}%" if rev.any() else "none")
         st.info("Net load = predicted load − predicted solar on matching timestamps and regions. "
-                "Negative values mean local PV exceeds demand (power flows back to the grid). " + metric_note)
+                "Negative values mean local PV exceeds demand (power flows back to the grid). "
+                "The dotted line is the 95% reserve level: the power to keep available so that demand is covered "
+                "95% of the time. " + metric_note)
     except Exception as error:
         st.error(f"Unable to calculate predicted net load: {error}")
 
@@ -269,13 +312,28 @@ try:
     if forecast.empty:
         raise ValueError("No matching forecast records were found.")
     forecast["Predicted Net Load (kW)"] = forecast["Predicted Load (kW)"] - forecast["Predicted Solar (kW)"]
-    c1, c2, c3 = st.columns(3)
+    net_sd = pick_sd(store, "sN", region_idx, rows=w)
+    forecast["Net Load 90% Low (kW)"] = forecast["Predicted Net Load (kW)"] - Z * net_sd
+    forecast["Net Load 90% High (kW)"] = forecast["Predicted Net Load (kW)"] + Z * net_sd
+    forecast["Suggested Reserve (kW)"] = Z * net_sd
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Average Forecast Load", f"{forecast['Predicted Load (kW)'].mean():.2f} kW")
     c2.metric("Peak Forecast Solar", f"{forecast['Predicted Solar (kW)'].max():.2f} kW")
     c3.metric("Peak Forecast Net Load", f"{forecast['Predicted Net Load (kW)'].max():.2f} kW")
+    c4.metric("Suggested Reserve (95%)", f"{forecast['Suggested Reserve (kW)'].max():.2f} kW")
+    reverse = forecast[forecast["Predicted Net Load (kW)"] < 0]
+    if not reverse.empty:
+        st.warning(f"Reverse power flow expected from {reverse['Time'].iloc[0]:%H:%M}: solar is forecast to exceed demand "
+                   f"by up to {-reverse['Predicted Net Load (kW)'].min():.1f} kW.")
+    else:
+        st.success("No reverse power flow expected in the next 3 hours.")
     fig = go.Figure()
-    for column in ["Predicted Load (kW)", "Predicted Solar (kW)", "Predicted Net Load (kW)"]:
-        fig.add_trace(go.Scatter(x=forecast["Time"], y=forecast[column], mode="lines+markers", name=column))
+    add_band(fig, forecast["Time"], forecast["Predicted Net Load (kW)"], net_sd, "Net Load 90% Range",
+             "rgba(0,204,150,0.18)")
+    for column, colour in [("Predicted Load (kW)", "#636EFA"), ("Predicted Solar (kW)", "#EF553B"),
+                           ("Predicted Net Load (kW)", "#00CC96")]:
+        fig.add_trace(go.Scatter(x=forecast["Time"], y=forecast[column], mode="lines+markers", name=column,
+                                 line=dict(color=colour)))
     fig.update_layout(title="Predicted Load, Solar and Net Load", xaxis_title="Forecast Time",
                       yaxis_title="Power (kW)", template="plotly_dark", height=500, hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)

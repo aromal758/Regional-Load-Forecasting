@@ -61,3 +61,35 @@ tab = tab.rename(columns={"L_MAE": "Load MAE (kW)", "PV_MAE": "PV MAE (kW)", "N_
 tab = tab.sort_values("Net MAE (kW)", na_position="last")
 tab.to_csv(out / "model_comparison.csv", index_label="Model")
 print(tab)
+
+
+# ---------------- all-regions total: cross-node error correlation (cross-fitted) ----------------
+# Regional forecast errors are partly correlated (shared weather). For the 21-region total we use
+# sigma_tot = sqrt(s^T C s), with the correlation matrix C estimated on the *other* half of the test
+# blocks (even/odd 2-day blocks), so the displayed coverage is out-of-sample.
+z = np.load(out / "ausgrid_cg_dashboard.npz")
+store = {k: z[k] for k in z.files}
+t = store["t"].astype(int); H6 = store["muL"].shape[1]
+L2, P2 = store["L_kw"].astype(float), store["PV_kw"].astype(float)
+mL, mP = store["muL"].astype(float), store["muP"].astype(float)
+sL2, sP2, r2 = store["sL"].astype(float), store["sP"].astype(float), store["rho"].astype(float)
+sN2 = np.sqrt(np.maximum(sL2 ** 2 + sP2 ** 2 - 2 * r2 * sL2 * sP2, 1e-6))
+block = np.cumsum(np.r_[1, np.diff(t) > 1]) % 2          # alternate test blocks: 0/1
+tot = {}
+for key, y_fn, mu, sd in [("L", lambda h: L2[t + h], mL, sL2), ("P", lambda h: P2[t + h], mP, sP2),
+                          ("N", lambda h: L2[t + h] - P2[t + h], mL - mP, sN2)]:
+    out_sd = np.zeros((len(t), H6), np.float32)
+    for h in range(1, H6 + 1):
+        zres = (y_fn(h) - mu[:, h - 1]) / np.maximum(sd[:, h - 1], 1e-3)
+        for part in (0, 1):
+            C = np.corrcoef(zres[block != part].T)
+            C = np.nan_to_num(C, nan=0.0); np.fill_diagonal(C, 1.0)
+            s = sd[block == part, h - 1]
+            out_sd[block == part, h - 1] = np.sqrt(np.maximum(np.einsum('bi,ij,bj->b', s, C, s), 1e-6))
+    tot[key] = out_sd
+yN = np.stack([L2[t + h].sum(1) - P2[t + h].sum(1) for h in range(1, H6 + 1)], 1)
+muN = (mL - mP).sum(2)
+print("all-regions 95%% reserve coverage by horizon (cross-fitted):",
+      np.round(np.mean(yN <= muN + 1.645 * tot["N"], 0), 3), " mean reserve kW:", np.round((1.645 * tot["N"]).mean(0), 1))
+store.update(sL_tot=tot["L"].astype(np.float16), sP_tot=tot["P"].astype(np.float16), sN_tot=tot["N"].astype(np.float16))
+np.savez_compressed(out / "ausgrid_cg_dashboard.npz", **store)
